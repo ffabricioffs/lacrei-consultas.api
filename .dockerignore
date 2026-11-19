@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+venv
+**/__pycache__
+**/*.pyc
+.env
+deploy/.env
+staticfiles
+.coverage
+coverage.xml
+htmlcov
+.idea
+.vscode
+docs
+.ruff_cache

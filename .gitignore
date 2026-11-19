@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Django
+staticfiles/
+*.sqlite3
+
+# Testes / cobertura
+.coverage
+coverage.xml
+htmlcov/
+
+# Segredos e estado local
+.env
+deploy/.env
+.deployed_tag
+.previous_tag
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
+
+# Ferramentas
+.ruff_cache/

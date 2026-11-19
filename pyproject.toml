@@ -1,0 +1,62 @@
+[project]
+name = "lacrei-consultas-api"
+version = "1.0.0"
+description = "API RESTful de gerenciamento de consultas médicas — Desafio Back-end Lacrei Saúde"
+authors = [{ name = "Fabrício Ferreira da Silva" }]
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "django (>=5.2,<6.0)",
+    "djangorestframework (>=3.16,<4.0)",
+    "djangorestframework-simplejwt (>=5.5,<6.0)",
+    "django-cors-headers (>=4.7,<5.0)",
+    "drf-spectacular (>=0.28,<1.0)",
+    "psycopg[binary] (>=3.2,<4.0)",
+    "dj-database-url (>=2.3,<4.0)",
+    "gunicorn (>=23.0,<24.0)",
+    "whitenoise (>=6.9,<7.0)",
+    "requests (>=2.32,<3.0)",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+ruff = ">=0.8"
+coverage = { version = ">=7.6", extras = ["toml"] }
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+# ---------------------------------------------------------------------------
+# Lint / formatação
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["**/migrations/*"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle | F: pyflakes | I: isort | B: bugbear | S: bandit (segurança)
+# UP: pyupgrade | DJ: boas práticas Django | SIM: simplificações
+select = ["E", "W", "F", "I", "B", "S", "UP", "DJ", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Nos testes, asserts e senhas fixas são esperados.
+"**/tests.py" = ["S101", "S105", "S106"]
+"**/tests/*" = ["S101", "S105", "S106"]
+"apps/core/factories.py" = ["S105", "S106"]
+
+# ---------------------------------------------------------------------------
+# Cobertura de testes
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["apps", "config"]
+omit = ["**/migrations/*", "**/tests.py", "apps/core/factories.py", "config/asgi.py", "config/wsgi.py"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80

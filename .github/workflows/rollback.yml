@@ -1,0 +1,60 @@
+name: Rollback
+
+# Rollback manual: Actions > Rollback > Run workflow.
+# Sem tag informada, volta para a versão anterior registrada no servidor (.previous_tag).
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente"
+        required: true
+        type: choice
+        options: [staging, production]
+      image_tag:
+        description: "Tag da imagem (ex.: sha-1a2b3c4). Vazio = versão anterior"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  rollback:
+    name: Rollback (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.APP_URL }}
+    steps:
+      - name: Validar tag informada
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [ -n "$IMAGE_TAG" ] && ! [[ "$IMAGE_TAG" =~ ^sha-[0-9a-f]{7}$ ]]; then
+            echo "Tag inválida: use o formato sha-xxxxxxx"; exit 1
+          fi
+
+      - name: Executar rollback no servidor
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -e
+            export IMAGE_NAME="$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+            cd "$DEPLOY_PATH"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            ./rollback.sh $IMAGE_TAG
+            docker logout ghcr.io
+
+      - name: Verificar saúde após o rollback
+        run: curl -fsS "${{ vars.APP_URL }}/health/"

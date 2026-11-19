@@ -1,0 +1,43 @@
+# Ambiente de DESENVOLVIMENTO local: API + PostgreSQL.
+#   docker compose up --build
+#   docker compose exec web python manage.py test
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: lacrei
+      POSTGRES_USER: lacrei
+      POSTGRES_PASSWORD: lacrei
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lacrei -d lacrei"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: .
+      args:
+        INSTALL_DEV: "true"
+    command: python manage.py runserver 0.0.0.0:8000
+    environment:
+      DJANGO_ENV: development
+      DJANGO_DEBUG: "true"
+      DATABASE_URL: postgres://lacrei:lacrei@db:5432/lacrei
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      RUN_MIGRATIONS: "true"
+      ASAAS_MOCK: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

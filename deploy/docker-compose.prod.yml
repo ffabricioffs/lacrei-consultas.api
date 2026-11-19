@@ -1,0 +1,55 @@
+# Stack de STAGING/PRODUÇÃO na EC2 (um diretório e um .env por ambiente).
+# A imagem vem do GitHub Container Registry; a tag é definida pelo deploy.sh.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  web:
+    image: ${IMAGE_NAME:?defina IMAGE_NAME}:${IMAGE_TAG:?defina IMAGE_TAG}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_VERSION: ${IMAGE_TAG}
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      # Domínio (ex.: api.seudominio.com.br) => HTTPS automático via Let's Encrypt.
+      # ":80" => apenas HTTP (útil para testar pelo IP público).
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    logging: *default-logging
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
