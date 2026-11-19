@@ -19,6 +19,29 @@ flowchart LR
 - **Mesma imagem** (`sha-<commit>`) promovida de staging para produção.
 - Para economizar no começo, é possível rodar os dois ambientes **na mesma instância**: use diretórios diferentes (`/opt/lacrei/staging` e `/opt/lacrei/production`) e, no staging, `HTTP_PORT=8080`/`HTTPS_PORT=8443` (ou um único Caddy na frente roteando por domínio). Para a entrega, o recomendado é uma instância por ambiente.
 
+## Caminho usado neste projeto: 1 instância + sslip.io
+
+Staging e produção rodam na **mesma EC2**, isolados por diretório (`/opt/lacrei/staging` e `/opt/lacrei/production`), com banco, volumes e `.env` próprios. Como não há domínio próprio, o endereço vem do [sslip.io](https://sslip.io): `54-12-34-56.sslip.io` resolve para `54.12.34.56`, e o Caddy emite o certificado HTTPS para ele.
+
+| Ambiente | URL | Portas |
+|---|---|---|
+| Produção | `https://<ip-com-hifens>.sslip.io` | 80 / 443 (HTTPS automático) |
+| Staging | `http://<ip-com-hifens>.sslip.io:8080` | 8080 (HTTP) |
+
+1. **EC2 → Launch instance** (região `sa-east-1`, São Paulo)
+   - Nome `lacrei-api`, AMI **Ubuntu Server 24.04 LTS**, tipo `t3.small` ou `t3.micro` (use o que aparecer como *Free tier eligible*), disco de 20 GB gp3
+   - Key pair: opcional (o acesso administrativo pode ser feito pelo **EC2 Instance Connect** no navegador)
+   - Security Group: SSH 22, HTTP 80, HTTPS 443 e TCP 8080, todos de `0.0.0.0/0`. O SSH só aceita chave; não há login por senha.
+   - **Advanced details → User data**: cole o conteúdo de [`deploy/ec2-user-data.sh`](../deploy/ec2-user-data.sh) com `__DEPLOY_PUBKEY__` substituído pela chave pública de deploy e `__GITHUB_REPO__` por `usuario/repositorio`
+2. Aguarde cerca de 3 minutos (o script instala Docker, cria swap e gera os `.env` com segredos aleatórios) e anote o **IP público**.
+3. Cadastre os Environments e secrets no GitHub (tabela da seção 3; aqui `SSH_HOST` é o mesmo IP nos dois ambientes) e crie a variável `DEPLOY_ENABLED=true`.
+4. Rode o workflow **CI/CD** e aprove o job de produção.
+5. Senha do usuário `admin` da API: **EC2 → Connect → EC2 Instance Connect** e `sudo cat /root/lacrei-info.txt`.
+
+> Não associe um Elastic IP *depois* do boot sem atualizar os `.env`: o endereço sslip.io é calculado a partir do IP do primeiro boot. O IP automático só muda se a instância for **parada**; reiniciar (reboot) não muda.
+
+As seções abaixo descrevem o caminho com **duas instâncias e domínio próprio**, que é a evolução recomendada.
+
 ## 1. Criar as instâncias
 
 No console da AWS (região `sa-east-1`, São Paulo, ou `us-east-1`, mais barata):

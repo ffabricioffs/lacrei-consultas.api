@@ -1,8 +1,11 @@
 import json
 import logging
+import os
+from io import StringIO
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.test import SimpleTestCase, override_settings
 from django.urls import reverse
 from rest_framework import status
@@ -166,6 +169,26 @@ class LogsEMiddlewareTests(AuthenticatedAPITestCase):
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self.assertTrue(response.headers["Content-Type"].startswith("application/json"))
+
+
+class GarantirSuperusuarioTests(APITestCase):
+    VARS = {"DJANGO_SUPERUSER_USERNAME": "admin", "DJANGO_SUPERUSER_PASSWORD": "senha-forte-123"}
+
+    def test_cria_superusuario_uma_unica_vez(self):
+        with patch.dict(os.environ, self.VARS):
+            call_command("garantir_superusuario", stdout=StringIO())
+            call_command("garantir_superusuario", stdout=StringIO())
+
+        user = get_user_model().objects.get(username="admin")
+        self.assertTrue(user.is_superuser)
+        self.assertTrue(user.check_password("senha-forte-123"))
+        self.assertEqual(get_user_model().objects.count(), 1)
+
+    def test_sem_variaveis_nao_faz_nada(self):
+        with patch.dict(os.environ, {"DJANGO_SUPERUSER_USERNAME": ""}):
+            call_command("garantir_superusuario", stdout=StringIO())
+
+        self.assertFalse(get_user_model().objects.exists())
 
 
 class SanitizacaoEValidadoresTests(SimpleTestCase):

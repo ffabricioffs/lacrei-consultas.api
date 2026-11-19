@@ -64,6 +64,8 @@ log "Garantindo banco de dados no ar"
 if [ "${SKIP_MIGRATIONS:-false}" != "true" ]; then
     log "Aplicando migrações"
     "${COMPOSE[@]}" run --rm --no-deps web python manage.py migrate --noinput
+    # Idempotente: cria o usuário da API definido em DJANGO_SUPERUSER_* só na primeira vez.
+    "${COMPOSE[@]}" run --rm --no-deps web python manage.py garantir_superusuario
 fi
 
 log "Subindo nova versão"
