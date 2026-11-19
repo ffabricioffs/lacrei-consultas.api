@@ -27,7 +27,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -68,7 +68,7 @@ jobs:
       DJANGO_SECRET_KEY: ci-somente-para-testes-chave-com-mais-de-32-bytes
       ASAAS_MOCK: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -122,7 +122,7 @@ jobs:
       image_name: ${{ steps.meta.outputs.image_name }}
       image_tag: ${{ steps.meta.outputs.image_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Definir nome e tag da imagem
         id: meta
@@ -177,7 +177,7 @@ jobs:
       IMAGE_NAME: ${{ needs.build.outputs.image_name }}
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Enviar arquivos de deploy para o servidor
         uses: appleboy/scp-action@v0.1.7
@@ -249,7 +249,7 @@ jobs:
       IMAGE_NAME: ${{ needs.build.outputs.image_name }}
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Enviar arquivos de deploy para o servidor
         uses: appleboy/scp-action@v0.1.7
