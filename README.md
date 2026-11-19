@@ -8,8 +8,8 @@ API RESTful para cadastro de **profissionais da saúde** e **consultas médicas*
 | **Autenticação** | JWT (`djangorestframework-simplejwt`) |
 | **Documentação da API** | Swagger em `/api/docs/` · Redoc em `/api/redoc/` · OpenAPI em `/api/schema/` |
 | **Deploy** | AWS EC2 + Docker Compose (staging e produção) com Caddy (HTTPS automático) |
-| **Staging** | `https://SEU-STAGING` <!-- preencha após o deploy --> |
-| **Produção** | `https://SUA-PRODUCAO` <!-- preencha após o deploy --> |
+| **Staging** | http://15-229-49-123.sslip.io:8080 · [Swagger](http://15-229-49-123.sslip.io:8080/api/docs/) |
+| **Produção** | https://15-229-49-123.sslip.io · [Swagger](https://15-229-49-123.sslip.io/api/docs/) |
 
 ---
 
@@ -123,8 +123,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8000/api/v1/consultas/?
 Pré-requisitos: Python 3.12+, [Poetry 2.x](https://python-poetry.org/docs/#installation) e um PostgreSQL acessível (o jeito mais simples é subir só o banco pelo Docker: `docker compose up -d db`).
 
 ```bash
-git clone https://github.com/<seu-usuario>/lacrei-consultas-api.git
-cd lacrei-consultas-api
+git clone https://github.com/ffabricioffs/lacrei-consultas.api.git
+cd lacrei-consultas.api
 
 poetry install                      # cria o virtualenv e instala dependências
 cp .env.example .env                # ajuste se necessário
