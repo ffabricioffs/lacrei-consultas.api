@@ -39,7 +39,7 @@ for _ in $(seq 1 20); do
     fi
     sleep 6
 done
-echo "${HEALTH:-{}}" > smoke-health.json
+printf '%s\n' "${HEALTH:-"{}"}" > smoke-health.json
 if [ "${STATUS:-}" = ok ] && { [ -z "$ESPERADA" ] || [ "$VERSAO" = "$ESPERADA" ]; }; then
     registrar ok "GET /health/" "\`${HEALTH}\`"
 else
