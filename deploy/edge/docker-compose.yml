@@ -1,0 +1,39 @@
+# Proxy reverso único (Caddy) na frente dos dois ambientes da mesma EC2.
+#
+#   https://<PRODUCTION_HOST>  -> web-production:8000
+#   https://<STAGING_HOST>     -> web-staging:8000
+#
+# Só este container publica portas no host (80 e 443). Os ambientes não
+# expõem nenhuma porta. O .env deste diretório contém apenas os hostnames
+# e é gerado pelo scripts/deploy.sh a partir do .env de cada ambiente.
+name: lacrei-edge
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    env_file: .env
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  edge:
+    name: lacrei-edge
+    external: true

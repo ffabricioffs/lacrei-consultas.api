@@ -1,8 +1,11 @@
 name: CI/CD
 
-# Pull requests: lint + testes + build (sem publicar).
-# Push na main: lint + testes + build/push da imagem + deploy em staging
-#               + deploy em produção (com aprovação manual no Environment "production").
+# Pull requests: lint + testes (com cobertura) + build da imagem (sem publicar).
+# Push na main:  lint → testes → build/push → deploy staging (+ smoke tests)
+#                → [aprovação manual] → deploy produção (+ smoke tests + relatório de segregação).
+#
+# Produção depende EXPLICITAMENTE do sucesso do deploy de staging: se o staging
+# falhar (inclusive nos smoke tests), o job de produção não é executado.
 on:
   pull_request:
     branches: [main]
@@ -16,6 +19,10 @@ concurrency:
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 env:
   PYTHON_VERSION: "3.12"
@@ -38,15 +45,23 @@ jobs:
           pip install "poetry==${POETRY_VERSION}"
           poetry install --only dev --no-root
 
-      - name: Ruff (lint + segurança)
+      - name: Ruff (lint + regras de segurança)
         run: poetry run ruff check --output-format=github .
 
       - name: Ruff (formatação)
         run: poetry run ruff format --check .
 
+      - name: Resumo
+        run: |
+          {
+            echo "## Lint"
+            echo
+            echo "✅ \`ruff check\` (pycodestyle, pyflakes, isort, bugbear, bandit, django) e \`ruff format --check\` sem apontamentos — $(poetry run ruff --version)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ---------------------------------------------------------------------------
   test:
-    name: Testes
+    name: Testes e cobertura
     needs: lint
     runs-on: ubuntu-latest
     services:
@@ -98,16 +113,33 @@ jobs:
 
       - name: Rodar testes (APITestCase) com cobertura
         run: |
-          poetry run coverage run manage.py test --verbosity 2
+          poetry run coverage run manage.py test --verbosity 2 2>&1 | tee test-output.txt
           poetry run coverage report
           poetry run coverage xml
 
-      - name: Publicar relatório de cobertura
+      - name: Resumo dos testes e da cobertura
+        if: always()
+        run: |
+          {
+            echo "## Testes (APITestCase + PostgreSQL 16)"
+            echo
+            echo '```'
+            grep -E '^(Ran [0-9]+ tests|OK|FAILED)' test-output.txt || true
+            echo '```'
+            echo
+            echo "### Cobertura"
+            echo
+            poetry run coverage report --format=markdown || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar relatórios
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-xml
-          path: coverage.xml
+          name: testes-e-cobertura
+          path: |
+            test-output.txt
+            coverage.xml
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
@@ -160,147 +192,49 @@ jobs:
         if: github.event_name != 'pull_request'
         run: docker push "${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.image_tag }}"
 
+      - name: Resumo
+        run: |
+          IMAGE="${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.image_tag }}"
+          TAMANHO="$(docker image inspect -f '{{.Size}}' "$IMAGE" | awk '{printf "%.0f MB", $1/1024/1024}')"
+          {
+            echo "## Build"
+            echo
+            echo "| Imagem | Tamanho | Usuário | Publicada |"
+            echo "|---|---|---|---|"
+            echo "| \`${IMAGE}\` | ${TAMANHO} | $(docker run --rm "$IMAGE" whoami) (não root) | ${{ github.event_name != 'pull_request' && 'sim (GHCR)' || 'não (pull request)' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ---------------------------------------------------------------------------
   deploy-staging:
-    name: Deploy (staging)
+    name: Staging
     needs: build
     # Só faz deploy depois que a AWS estiver configurada (variável de repositório DEPLOY_ENABLED=true).
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    environment:
-      name: staging
-      url: ${{ vars.APP_URL }}
     permissions:
       contents: read
       packages: read
-    env:
-      IMAGE_NAME: ${{ needs.build.outputs.image_name }}
-      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Enviar arquivos de deploy para o servidor
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "deploy/docker-compose.prod.yml,deploy/Caddyfile,scripts/deploy.sh,scripts/rollback.sh"
-          target: ${{ secrets.DEPLOY_PATH }}
-          strip_components: 1
-
-      - name: Deploy via SSH (com rollback automático se o healthcheck falhar)
-        uses: appleboy/ssh-action@v1
-        env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,GHCR_USER,GHCR_TOKEN
-          script: |
-            set -e
-            cd "$DEPLOY_PATH"
-            chmod +x deploy.sh rollback.sh
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            ./deploy.sh "$IMAGE_TAG"
-            docker logout ghcr.io
-
-      - name: Smoke test externo
-        id: smoke
-        run: |
-          for i in $(seq 1 10); do
-            if curl -fsS "${{ vars.APP_URL }}/health/" | grep -q "\"version\": \"${IMAGE_TAG}\""; then
-              echo "OK: ${IMAGE_TAG} no ar"; exit 0
-            fi
-            sleep 5
-          done
-          echo "Smoke test falhou"; exit 1
-
-      # Só roda se o deploy passou no servidor mas o teste externo falhou
-      # (falhas no deploy.sh já disparam o rollback automático dentro do servidor).
-      - name: Rollback se o smoke test falhar
-        if: failure() && steps.smoke.outcome == 'failure'
-        uses: appleboy/ssh-action@v1
-        env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_NAME,DEPLOY_PATH
-          script: cd "$DEPLOY_PATH" && ./rollback.sh
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      image_name: ${{ needs.build.outputs.image_name }}
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    secrets: inherit
 
   # ---------------------------------------------------------------------------
   deploy-production:
-    name: Deploy (produção)
+    name: Produção
     needs: [build, deploy-staging]
-    runs-on: ubuntu-latest
-    # Configure "Required reviewers" no Environment "production" para exigir aprovação.
-    environment:
-      name: production
-      url: ${{ vars.APP_URL }}
+    # Produção só segue se o deploy de staging (incluindo smoke tests) terminou com sucesso.
+    # A aprovação manual vem do Environment "production" (Required reviewers).
+    if: needs.deploy-staging.result == 'success'
     permissions:
       contents: read
       packages: read
-    env:
-      IMAGE_NAME: ${{ needs.build.outputs.image_name }}
-      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Enviar arquivos de deploy para o servidor
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "deploy/docker-compose.prod.yml,deploy/Caddyfile,scripts/deploy.sh,scripts/rollback.sh"
-          target: ${{ secrets.DEPLOY_PATH }}
-          strip_components: 1
-
-      - name: Deploy via SSH (com rollback automático se o healthcheck falhar)
-        uses: appleboy/ssh-action@v1
-        env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,GHCR_USER,GHCR_TOKEN
-          script: |
-            set -e
-            cd "$DEPLOY_PATH"
-            chmod +x deploy.sh rollback.sh
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            ./deploy.sh "$IMAGE_TAG"
-            docker logout ghcr.io
-
-      - name: Smoke test externo
-        id: smoke
-        run: |
-          for i in $(seq 1 10); do
-            if curl -fsS "${{ vars.APP_URL }}/health/" | grep -q "\"version\": \"${IMAGE_TAG}\""; then
-              echo "OK: ${IMAGE_TAG} no ar"; exit 0
-            fi
-            sleep 5
-          done
-          echo "Smoke test falhou"; exit 1
-
-      # Só roda se o deploy passou no servidor mas o teste externo falhou
-      # (falhas no deploy.sh já disparam o rollback automático dentro do servidor).
-      - name: Rollback se o smoke test falhar
-        if: failure() && steps.smoke.outcome == 'failure'
-        uses: appleboy/ssh-action@v1
-        env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_NAME,DEPLOY_PATH
-          script: cd "$DEPLOY_PATH" && ./rollback.sh
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: production
+      image_name: ${{ needs.build.outputs.image_name }}
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    secrets: inherit

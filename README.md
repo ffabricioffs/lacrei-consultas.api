@@ -7,9 +7,10 @@ API RESTful para cadastro de **profissionais da saúde** e **consultas médicas*
 | **Stack** | Python 3.12 · Django 5.2 · Django REST Framework · PostgreSQL 16 · Poetry · Docker · GitHub Actions |
 | **Autenticação** | JWT (`djangorestframework-simplejwt`) |
 | **Documentação da API** | Swagger em `/api/docs/` · Redoc em `/api/redoc/` · OpenAPI em `/api/schema/` |
-| **Deploy** | AWS EC2 + Docker Compose (staging e produção) com Caddy (HTTPS automático) |
-| **Staging** | http://15-229-49-123.sslip.io:8080 · [Swagger](http://15-229-49-123.sslip.io:8080/api/docs/) |
-| **Produção** | https://15-229-49-123.sslip.io · [Swagger](https://15-229-49-123.sslip.io/api/docs/) |
+| **Deploy** | AWS EC2 + Docker Compose: staging e produção na **mesma instância**, isolados ([detalhes](#ambientes-staging-e-produção-na-mesma-ec2)), atrás de um único Caddy com HTTPS |
+| **Staging** | https://staging.15-229-49-123.sslip.io · [Swagger](https://staging.15-229-49-123.sslip.io/api/docs/) · [/health/](https://staging.15-229-49-123.sslip.io/health/) |
+| **Produção** | https://15-229-49-123.sslip.io · [Swagger](https://15-229-49-123.sslip.io/api/docs/) · [/health/](https://15-229-49-123.sslip.io/health/) |
+| **Evidências da avaliação** | [docs/ENTREGA.md](docs/ENTREGA.md): commit avaliado, execução do pipeline e versões no ar |
 
 ---
 
@@ -26,10 +27,12 @@ API RESTful para cadastro de **profissionais da saúde** e **consultas médicas*
 9. [Logs](#logs)
 10. [CI/CD](#cicd)
 11. [Deploy na AWS](#deploy-na-aws)
-12. [Rollback](#rollback)
-13. [Integração com o Asaas (bônus)](#integração-com-o-asaas-bônus)
-14. [Decisões técnicas](#decisões-técnicas)
-15. [Critérios de aceite](#critérios-de-aceite)
+12. [Ambientes: staging e produção na mesma EC2](#ambientes-staging-e-produção-na-mesma-ec2)
+13. [Rollback](#rollback)
+14. [Integração com o Asaas (bônus)](#integração-com-o-asaas-bônus)
+15. [Decisões técnicas](#decisões-técnicas)
+16. [Critérios de aceite](#critérios-de-aceite)
+17. [Ajustes da devolutiva](#ajustes-da-devolutiva)
 
 ---
 
@@ -52,10 +55,10 @@ API RESTful para cadastro de **profissionais da saúde** e **consultas médicas*
 │   ├── consultas/      # modelo, serializers, views e testes de consultas
 │   └── pagamentos/     # integração Asaas (cliente real + mock), cobranças e webhook
 ├── config/             # settings (12-factor, via variáveis de ambiente) e urls
-├── deploy/             # docker-compose de produção, Caddyfile e .env de exemplo do servidor
-├── scripts/            # entrypoint, deploy.sh (com rollback automático) e rollback.sh
-├── docs/               # decisões técnicas, deploy AWS, rollback e Asaas
-├── .github/workflows/  # ci-cd.yml (lint → testes → build → deploy) e rollback.yml
+├── deploy/             # compose de cada ambiente, proxy único (edge/), user data da EC2
+├── scripts/            # entrypoint, deploy.sh, rollback.sh, smoke-test.sh, segregation-report.sh
+├── docs/               # decisões, deploy AWS, rollback, logs, Asaas e evidências da entrega
+├── .github/workflows/  # ci-cd.yml, deploy.yml (reutilizável) e rollback.yml
 ├── Dockerfile          # multi-stage, sem root, com HEALTHCHECK
 └── docker-compose.yml  # ambiente local (API + PostgreSQL)
 ```
@@ -202,9 +205,10 @@ A cobertura mínima é verificada no CI (`fail_under` em `pyproject.toml`).
 | **CORS** | `django-cors-headers` com **lista explícita** de origens (`CORS_ALLOWED_ORIGINS`), restrito a `/api/`, sem credenciais e sem curinga `*`. |
 | **Autenticação** | JWT obrigatório por padrão (`IsAuthenticated` global); só healthcheck, docs, obtenção de token e webhook (com token próprio, comparação em tempo constante) são públicos. |
 | **Abuso e DoS** | Rate limiting do DRF (30/min anônimo, 300/min autenticado) e corpo da requisição limitado a 1 MB no proxy reverso (Caddy). |
-| **Transporte e cabeçalhos** | HTTPS via Caddy (Let's Encrypt), HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, cookies `Secure`/`HttpOnly`, redirecionamento para HTTPS configurável. |
+| **Transporte e cabeçalhos** | HTTPS via Caddy (Let's Encrypt) nos dois ambientes, HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, cookies `Secure`/`HttpOnly`, HTTP redirecionado para HTTPS. |
+| **Rede na AWS** | Só as portas 80 e 443 ficam abertas para a internet. A porta 22 aceita apenas o EC2 Instance Connect e, durante cada deploy, o IP do runner (/32), liberado e revogado pelo pipeline via OIDC. A antiga porta 8080 do staging foi fechada. Detalhes em [docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md#segurança-de-rede). |
 | **Vazamento de informação** | Erros inesperados viram `{"detail": "Erro interno do servidor."}`; o stack trace vai só para o log. `DEBUG=false` fora do desenvolvimento e `SECRET_KEY` obrigatória em staging/produção. |
-| **Dados pessoais (LGPD)** | Logs não registram corpo nem query string. O CPF do paciente vai direto ao Asaas e não é armazenado. |
+| **Dados pessoais (LGPD)** | Logs não registram corpo nem query string, e o IP é anonimizado (prefixo /24 ou /48). O CPF do paciente vai direto ao Asaas e não é armazenado. Política de logs em [docs/LOGS.md](docs/LOGS.md). |
 | **Container** | Imagem multi-stage, sem Poetry nem ferramentas de build, executando como usuário sem privilégios. |
 | **Análise estática** | Ruff com regras do Bandit (`S`) e do Django (`DJ`) no CI; Dependabot para dependências, actions e imagem base. |
 
@@ -212,21 +216,28 @@ A cobertura mínima é verificada no CI (`fail_under` em `pyproject.toml`).
 
 Os logs saem em **JSON no stdout** (um objeto por linha), prontos para o CloudWatch ou qualquer agregador:
 
-- **`lacrei.access`**: uma linha por requisição, com `request_id`, método, rota, status, duração, `user_id`, IP e user agent. Respostas 4xx saem como `WARNING` e 5xx como `ERROR`.
+- **`lacrei.access`**: uma linha por requisição, com `request_id`, método, rota, status, duração, `user_id`, IP **anonimizado** e user agent (até 200 caracteres). Respostas 4xx saem como `WARNING` e 5xx como `ERROR`.
 - **`lacrei.errors`**: exceções não tratadas, com stack trace e `request_id` para correlação.
 - **`lacrei.pagamentos`**: eventos da integração com o Asaas.
 
 Toda resposta traz o cabeçalho `X-Request-ID`, que também pode ser enviado pelo cliente para rastreio ponta a ponta.
 
 ```json
-{"timestamp": "2026-11-19T19:10:00+00:00", "level": "INFO", "logger": "lacrei.access", "message": "GET /api/v1/consultas/ 200", "request_id": "3f2a...", "method": "GET", "path": "/api/v1/consultas/", "status": 200, "duration_ms": 12.4, "user_id": 1, "ip": "203.0.113.10", "user_agent": "curl/8.5.0"}
+{"timestamp": "2026-11-19T19:10:00+00:00", "level": "INFO", "logger": "lacrei.access", "message": "GET /api/v1/consultas/ 200", "request_id": "3f2a...", "method": "GET", "path": "/api/v1/consultas/", "status": 200, "duration_ms": 12.4, "user_id": 1, "ip": "203.0.113.0", "user_agent": "curl/8.5.0"}
 ```
 
-Na EC2, os logs ficam no driver `json-file` do Docker com rotação (10 MB × 5 arquivos). Para centralizar no CloudWatch, veja [docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md#logs-no-cloudwatch-opcional).
+**Finalidade, acesso e retenção** dos logs que registram IP e user agent estão em **[docs/LOGS.md](docs/LOGS.md)**. Em resumo:
+
+| | |
+|---|---|
+| **Finalidade** | Segurança (abuso, força bruta, varreduras), auditoria (`user_id` + `request_id`) e diagnóstico |
+| **Minimização** | IP gravado só como prefixo de rede (`LOG_ANONYMIZE_IP=true`); sem corpo, query string, tokens ou senhas |
+| **Acesso** | Somente administradores da conta AWS, via EC2 Instance Connect (IAM + CloudTrail); arquivos legíveis só por `root`/grupo `docker` |
+| **Retenção** | Rotação de 10 MB × 5 arquivos por container, descartados a cada deploy; 30 dias se centralizados no CloudWatch |
 
 ## CI/CD
 
-Arquivo: [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml)
+Arquivos: [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) (pipeline) e [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) (deploy reutilizável por staging, produção e rollback).
 
 ```mermaid
 flowchart LR
@@ -234,12 +245,13 @@ flowchart LR
     B --> C[Testes<br/>PostgreSQL service<br/>migrações + check --deploy<br/>coverage]
     C --> D[Build<br/>Docker + smoke test]
     D -->|só na main| E[Push GHCR<br/>tag sha-xxxxxxx]
-    E --> F[Deploy staging<br/>SSH + deploy.sh]
-    F --> G{Healthcheck<br/>+ smoke test}
-    G -->|ok| H[Aprovação manual]
+    E --> F[Deploy staging<br/>SSH temporário via OIDC<br/>+ deploy.sh]
+    F --> G{Healthcheck<br/>+ smoke tests}
+    G -->|sucesso| H[Aprovação manual<br/>Environment production]
     H --> I[Deploy produção]
-    I --> J{Healthcheck<br/>+ smoke test}
-    G -->|falha| R[Rollback automático]
+    I --> J{Healthcheck<br/>+ smoke tests}
+    J -->|ok| K[Relatório de<br/>segregação]
+    G -->|falha: produção NÃO roda| R[Rollback automático]
     J -->|falha| R
 ```
 
@@ -248,8 +260,10 @@ flowchart LR
 | **Lint** | `ruff check` (estilo, bugs, segurança) e `ruff format --check` |
 | **Testes** | Sobe PostgreSQL como service, checa migrações pendentes, roda `manage.py check --deploy` e executa a suíte com cobertura mínima |
 | **Build** | Gera a imagem com a tag `sha-<commit>`, verifica que o Django carrega e que o container não roda como root; na `main`, publica no GitHub Container Registry |
-| **Deploy staging** | Copia os arquivos de deploy por SCP e executa `deploy.sh` por SSH; confirma pelo `/health/` público que a nova versão está no ar |
-| **Deploy produção** | Mesma imagem que passou em staging, liberada só após **aprovação manual** (Environment `production` com *required reviewers*) |
+| **Deploy staging** | Libera SSH só para o IP do runner (OIDC), copia os arquivos, executa `deploy.sh` e roda os smoke tests externos (`scripts/smoke-test.sh`): `/health/` com a versão esperada, certificado TLS, HTTP → HTTPS, API exigindo token, login inválido recusado, OpenAPI e cabeçalhos de segurança. Revoga o SSH ao final |
+| **Deploy produção** | Só roda se o job de staging terminou com **sucesso** (`if: needs.deploy-staging.result == 'success'`) e após **aprovação manual** (Environment `production` com *required reviewers*). Mesma imagem, mesmos smoke tests, e no fim publica o relatório de segregação entre os ambientes |
+
+Cada etapa escreve um **resumo na página da execução** (lint, testes e cobertura por arquivo, imagem, smoke tests, versão no ar e relatório de segregação) e publica artefatos (`test-output.txt`, `coverage.xml`, `smoke-health.json`, `segregation-report.md`).
 
 Pull requests rodam lint, testes e build, mas não publicam nem fazem deploy. Os jobs de deploy só rodam quando a variável de repositório `DEPLOY_ENABLED` vale `true` (*Settings → Secrets and variables → Actions → Variables*), o que evita falhas antes de a AWS estar configurada.
 
@@ -257,23 +271,41 @@ Pull requests rodam lint, testes e build, mas não publicam nem fazem deploy. Os
 
 | Nome | Tipo | Exemplo |
 |---|---|---|
-| `SSH_HOST` | secret | IP elástico ou DNS da EC2 |
-| `SSH_USER` | secret | `ubuntu` |
-| `SSH_PRIVATE_KEY` | secret | chave privada de deploy (conteúdo do arquivo) |
-| `DEPLOY_PATH` | secret | `/opt/lacrei/staging` ou `/opt/lacrei/production` |
-| `APP_URL` | variable | `https://staging-api.seudominio.com.br` |
+| `SSH_HOST` | secret (por Environment) | IP público da EC2 |
+| `SSH_USER` | secret (por Environment) | `ubuntu` |
+| `SSH_PRIVATE_KEY` | secret (por Environment) | chave privada de deploy |
+| `DEPLOY_PATH` | secret (por Environment) | `/opt/lacrei/staging` ou `/opt/lacrei/production` |
+| `APP_URL` | variable (por Environment) | `https://staging.15-229-49-123.sslip.io` |
+| `AWS_DEPLOY_ROLE_ARN`, `AWS_REGION`, `AWS_SECURITY_GROUP_ID`, `DEPLOY_ENABLED` | variables (repositório) | papel IAM do OIDC, `sa-east-1`, grupo de segurança da EC2, `true` |
 
 ## Deploy na AWS
 
-Resumo (passo a passo completo em **[docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md)**):
+Passo a passo completo, arquitetura e segurança de rede em **[docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md)**. Em resumo:
 
-1. Criar uma EC2 por ambiente (Ubuntu 24.04, `t3.micro`/`t3.small`) com IP elástico e Security Group liberando 22 (só para o seu IP e para o GitHub Actions), 80 e 443.
-2. Instalar Docker e o plugin Compose; criar `/opt/lacrei/<ambiente>/.env` a partir de [`deploy/.env.server.example`](deploy/.env.server.example).
-3. Apontar o DNS (`staging-api...` e `api...`) para os IPs elásticos; o Caddy emite os certificados HTTPS sozinho.
-4. Cadastrar os secrets nos Environments do GitHub e dar push na `main`.
-5. Criar o usuário de acesso: `docker compose -f docker-compose.prod.yml exec web python manage.py createsuperuser`.
+1. Uma EC2 (`t3.micro`, `sa-east-1`) criada com [`deploy/ec2-user-data.sh`](deploy/ec2-user-data.sh), que instala o Docker e gera os segredos de cada ambiente na própria máquina.
+2. Um provedor OIDC do GitHub e um papel IAM que só pode abrir e fechar a regra SSH desse grupo de segurança.
+3. Environments `staging` e `production` no GitHub, com secrets próprios; produção exige aprovação manual.
+4. Push na `main`: o pipeline faz deploy em staging e, depois da aprovação, em produção. A **mesma imagem** é promovida de um para o outro.
 
-Cada ambiente tem banco, segredos e domínio próprios, e a **mesma imagem** é promovida de staging para produção.
+## Ambientes: staging e produção na mesma EC2
+
+**Os dois ambientes rodam na mesma instância EC2** (`lacrei-api`, IP `15.229.49.123`), por custo (free tier). Eles são isolados como projetos Docker Compose independentes, e só o proxy é compartilhado:
+
+| Recurso | Staging | Produção |
+|---|---|---|
+| URL | https://staging.15-229-49-123.sslip.io | https://15-229-49-123.sslip.io |
+| Diretório e projeto Compose | `/opt/lacrei/staging` → `staging` | `/opt/lacrei/production` → `production` |
+| Banco de dados | container `staging-db-1` | container `production-db-1` |
+| Volume de dados | `staging_pgdata` | `production_pgdata` |
+| Rede do banco | `staging_backend` (interna, sem internet) | `production_backend` (interna, sem internet) |
+| Segredos | `/opt/lacrei/staging/.env` (600) | `/opt/lacrei/production/.env` (600) |
+| `SECRET_KEY`, senha do banco, senha do admin, token do webhook | gerados só para staging | gerados só para produção |
+| Configuração não sensível | GitHub Environment `staging` | GitHub Environment `production` (com aprovação) |
+| Compartilhado | proxy Caddy (`/opt/lacrei/edge`) e a rede `lacrei-edge`, da qual participam só o proxy e os containers `web` | |
+
+**Demonstração:** o job de produção executa [`scripts/segregation-report.sh`](scripts/segregation-report.sh) na EC2 e publica o relatório no resumo da execução. O relatório mostra containers, redes, volumes e permissões, compara cada segredo entre os ambientes (indicando só "diferente" ou "igual", nunca o valor) e testa que o `web` de um ambiente não alcança o banco do outro. O relatório da execução avaliada está em [docs/ENTREGA.md](docs/ENTREGA.md).
+
+**Limitação conhecida:** CPU, memória, disco e kernel são compartilhados. A evolução recomendada é uma instância (ou conta AWS) por ambiente; veja [docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md#evolução-recomendada).
 
 ## Rollback
 
@@ -301,7 +333,9 @@ Justificativas completas, problemas encontrados e melhorias propostas em **[docs
 - **Endereço e contato como objetos aninhados na API, mas colunas simples no banco**: a API fica legível e o banco simples de consultar e indexar.
 - **`on_delete=PROTECT`**: histórico de consultas e cobranças não pode desaparecer em cascata.
 - **EC2 + Docker Compose + Caddy**: o mesmo artefato roda em dev, staging e produção; custo baixo (cabe no free tier) e HTTPS automático. ECS Fargate + RDS está descrito como evolução natural.
-- **GHCR** como registry: integrado ao GitHub, sem credenciais AWS extras no pipeline.
+- **Staging e produção na mesma EC2, atrás de um único proxy**: separação por projeto Compose, rede, volume e segredos, com custo de uma única instância.
+- **OIDC em vez de chaves AWS**: o GitHub recebe credenciais temporárias só para abrir e fechar a regra SSH do próprio runner.
+- **GHCR** como registry: integrado ao GitHub, sem credenciais de registry extras no servidor.
 - **Logs em JSON no stdout** (12-factor): o destino (arquivo, CloudWatch, Loki) é decisão de infraestrutura, não de código.
 
 ## Critérios de aceite
@@ -318,3 +352,14 @@ Justificativas completas, problemas encontrados e melhorias propostas em **[docs
 | README + rollback + justificativas | ✅ | este arquivo, `docs/` |
 | Documentação da API (opcional) | ✅ | `/api/docs/`, `/api/redoc/` |
 | Integração Asaas (opcional) | ✅ | `apps/pagamentos`, `docs/ASAAS.md` |
+
+## Ajustes da devolutiva
+
+| # | Pedido | O que foi feito | Onde |
+|---|---|---|---|
+| 1 | Produção só após staging com sucesso, mantendo a aprovação manual | `deploy-production` com `needs: [build, deploy-staging]` e `if: needs.deploy-staging.result == 'success'`; aprovação pelo Environment `production` | `.github/workflows/ci-cd.yml` |
+| 2 | Execução aprovada no commit avaliado (lint, testes, cobertura, build, smoke tests) | Resumos e artefatos em cada etapa; link da execução e commit avaliado | [docs/ENTREGA.md](docs/ENTREGA.md) |
+| 3 | Staging e produção funcionando, com a versão de cada `/health/` | Os dois em HTTPS na porta 443; versão registrada pelo pipeline | [docs/ENTREGA.md](docs/ENTREGA.md) |
+| 4 | Mesma EC2 e segregação de banco, volumes, segredos e configurações | Seção acima e relatório automático de segregação | [Ambientes](#ambientes-staging-e-produção-na-mesma-ec2), `scripts/segregation-report.sh` |
+| 5 | Restringir SSH e a porta de staging | Porta 22 fechada para a internet (SSH temporário via OIDC + Instance Connect); porta 8080 removida | [docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md#segurança-de-rede) |
+| 6 | Finalidade, acesso e retenção dos logs com IP e user agent | Política de logs e anonimização do IP | [docs/LOGS.md](docs/LOGS.md), `apps/core/middleware.py` |

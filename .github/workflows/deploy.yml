@@ -1,0 +1,179 @@
+name: Deploy (reutilizável)
+
+# Chamado pelo ci-cd.yml (deploy) e pelo rollback.yml (rollback).
+#
+# Segurança do acesso SSH:
+#   A porta 22 da EC2 NÃO fica aberta para a internet. Cada execução obtém
+#   credenciais AWS temporárias via OIDC (sem chaves de longa duração no
+#   GitHub), libera a porta 22 apenas para o IP deste runner (/32) e revoga a
+#   regra ao final, mesmo em caso de falha.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "staging ou production"
+        required: true
+        type: string
+      image_name:
+        required: true
+        type: string
+      image_tag:
+        description: "Tag da imagem. No rollback, vazio = versão anterior."
+        required: false
+        type: string
+        default: ""
+      action:
+        description: "deploy ou rollback"
+        required: false
+        type: string
+        default: deploy
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: ${{ inputs.action == 'rollback' && 'Rollback' || 'Deploy' }} ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.APP_URL }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      IMAGE_NAME: ${{ inputs.image_name }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      ACTION: ${{ inputs.action }}
+      APP_URL: ${{ vars.APP_URL }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalizar nome da imagem
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Credenciais AWS temporárias (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Liberar SSH só para este runner
+        id: ssh
+        env:
+          SG_ID: ${{ vars.AWS_SECURITY_GROUP_ID }}
+        run: |
+          IP="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')"
+          echo "ip=${IP}" >> "$GITHUB_OUTPUT"
+          if ! saida="$(aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+              --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${IP}/32,Description=github-actions-${GITHUB_RUN_ID}}]" 2>&1)"; then
+            grep -q 'InvalidPermission.Duplicate' <<<"$saida" || { echo "$saida"; exit 1; }
+          fi
+          echo "SSH liberado temporariamente para ${IP}/32 (será revogado ao final do job)."
+          sleep 5
+
+      - name: Enviar arquivos de deploy para o servidor
+        if: inputs.action == 'deploy'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "deploy/docker-compose.prod.yml,deploy/edge/docker-compose.yml,deploy/edge/Caddyfile,scripts/deploy.sh,scripts/rollback.sh,scripts/segregation-report.sh"
+          target: ${{ secrets.DEPLOY_PATH }}
+          strip_components: 1
+
+      - name: ${{ inputs.action == 'rollback' && 'Rollback' || 'Deploy' }} via SSH (rollback automático se o healthcheck falhar)
+        uses: appleboy/ssh-action@v1
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE_NAME,IMAGE_TAG,APP_URL,DEPLOY_PATH,ACTION,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -e
+            cd "$DEPLOY_PATH"
+            chmod +x ./*.sh
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            if [ "$ACTION" = rollback ]; then
+              ./rollback.sh $IMAGE_TAG
+            else
+              ./deploy.sh "$IMAGE_TAG"
+            fi
+            docker logout ghcr.io
+
+      - name: Smoke tests externos
+        id: smoke
+        run: |
+          chmod +x scripts/smoke-test.sh
+          ESPERADA=""
+          [ "$ACTION" = deploy ] && ESPERADA="$IMAGE_TAG"
+          scripts/smoke-test.sh "$APP_URL" "$ESPERADA"
+
+      # Só roda se o deploy passou no servidor mas o teste externo falhou
+      # (falhas no deploy.sh já disparam o rollback automático dentro do servidor).
+      - name: Rollback se o smoke test falhar
+        if: failure() && steps.smoke.outcome == 'failure' && inputs.action == 'deploy'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE_NAME,DEPLOY_PATH
+          script: cd "$DEPLOY_PATH" && ./rollback.sh
+
+      - name: Relatório de segregação entre ambientes
+        if: success() && inputs.environment == 'production'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
+            "${SSH_USER}@${SSH_HOST}" "cd '${DEPLOY_PATH}' && ./segregation-report.sh" > segregation-report.md
+          cat segregation-report.md >> "$GITHUB_STEP_SUMMARY"
+          rm -f ~/.ssh/deploy_key
+
+      - name: Registrar versão no ar
+        if: success()
+        run: |
+          {
+            echo "### Ambiente ${{ inputs.environment }}"
+            echo
+            echo "- URL: ${APP_URL}"
+            echo "- Imagem: \`${IMAGE_NAME}:${IMAGE_TAG:-versão anterior}\`"
+            echo "- /health/: \`$(cat smoke-health.json)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar evidências
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidencias-${{ inputs.environment }}-${{ inputs.action }}
+          path: |
+            smoke-health.json
+            segregation-report.md
+          if-no-files-found: ignore
+
+      - name: Revogar acesso SSH temporário
+        if: always() && steps.ssh.outputs.ip != ''
+        env:
+          SG_ID: ${{ vars.AWS_SECURITY_GROUP_ID }}
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$SG_ID" \
+            --protocol tcp --port 22 --cidr "${{ steps.ssh.outputs.ip }}/32" > /dev/null
+          echo "Regra SSH temporária para ${{ steps.ssh.outputs.ip }}/32 revogada."

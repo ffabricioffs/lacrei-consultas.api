@@ -1,0 +1,28 @@
+# Hosts vêm do .env do diretório edge (gerado pelo deploy.sh).
+# Os valores padrão *.localhost só valem até o primeiro deploy de cada ambiente.
+
+(comum) {
+	encode gzip
+
+	# A API só recebe JSON pequeno.
+	request_body {
+		max_size 1MB
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+	}
+}
+
+{$PRODUCTION_HOST:production.localhost} {
+	import comum
+	reverse_proxy web-production:8000
+}
+
+{$STAGING_HOST:staging.localhost} {
+	import comum
+	header X-Robots-Tag "noindex, nofollow"
+	reverse_proxy web-staging:8000
+}

@@ -2,6 +2,7 @@ name: Rollback
 
 # Rollback manual: Actions > Rollback > Run workflow.
 # Sem tag informada, volta para a versão anterior registrada no servidor (.previous_tag).
+# Usa o mesmo workflow de deploy (SSH temporário via OIDC + smoke tests).
 on:
   workflow_dispatch:
     inputs:
@@ -17,15 +18,11 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
-  rollback:
-    name: Rollback (${{ inputs.environment }})
+  validar:
+    name: Validar parâmetros
     runs-on: ubuntu-latest
-    environment:
-      name: ${{ inputs.environment }}
-      url: ${{ vars.APP_URL }}
     steps:
       - name: Validar tag informada
         env:
@@ -35,26 +32,17 @@ jobs:
             echo "Tag inválida: use o formato sha-xxxxxxx"; exit 1
           fi
 
-      - name: Executar rollback no servidor
-        uses: appleboy/ssh-action@v1
-        env:
-          IMAGE_NAME: ghcr.io/${{ github.repository }}
-          IMAGE_TAG: ${{ inputs.image_tag }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,GHCR_USER,GHCR_TOKEN
-          script: |
-            set -e
-            export IMAGE_NAME="$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
-            cd "$DEPLOY_PATH"
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            ./rollback.sh $IMAGE_TAG
-            docker logout ghcr.io
-
-      - name: Verificar saúde após o rollback
-        run: curl -fsS "${{ vars.APP_URL }}/health/"
+  rollback:
+    name: Rollback
+    needs: validar
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_name: ghcr.io/${{ github.repository }}
+      image_tag: ${{ inputs.image_tag }}
+      action: rollback
+    secrets: inherit

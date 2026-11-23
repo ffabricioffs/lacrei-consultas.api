@@ -220,6 +220,8 @@ SESSION_COOKIE_HTTPONLY = True
 # Logs (JSON no stdout — coletados pelo Docker / CloudWatch)
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# Registra só o prefixo de rede do IP (/24 IPv4, /48 IPv6). Ver docs/LOGS.md.
+LOG_ANONYMIZE_IP = env_bool("LOG_ANONYMIZE_IP", default=True)
 if TESTING:
     LOG_LEVEL = "CRITICAL"
 

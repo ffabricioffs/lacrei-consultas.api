@@ -13,6 +13,7 @@ from rest_framework.test import APITestCase
 
 from apps.core.factories import AuthenticatedAPITestCase
 from apps.core.log_formatters import JsonFormatter
+from apps.core.middleware import anonymize_ip
 from apps.core.sanitizers import only_digits, sanitize_text
 from apps.core.validators import cnpj_valido, cpf_ou_cnpj_valido, cpf_valido
 
@@ -136,6 +137,28 @@ class LogsEMiddlewareTests(AuthenticatedAPITestCase):
         self.assertEqual(registro.path, "/api/v1/profissionais/")
         self.assertEqual(registro.user_id, self.user.pk)
 
+    def test_log_de_acesso_anonimiza_ip_e_nao_registra_query_string(self):
+        with self.assertLogs("lacrei.access", level="INFO") as logs:
+            self.client.get(
+                reverse("profissional-list"),
+                {"search": "dado-pessoal"},
+                REMOTE_ADDR="203.0.113.42",
+                HTTP_USER_AGENT="x" * 500,
+            )
+
+        registro = logs.records[0]
+        self.assertEqual(registro.ip, "203.0.113.0")
+        self.assertEqual(len(registro.user_agent), 200)
+        self.assertNotIn("dado-pessoal", registro.getMessage())
+        self.assertNotIn("dado-pessoal", registro.path)
+
+    @override_settings(LOG_ANONYMIZE_IP=False)
+    def test_anonimizacao_pode_ser_desligada(self):
+        with self.assertLogs("lacrei.access", level="INFO") as logs:
+            self.client.get(reverse("health"), REMOTE_ADDR="203.0.113.42")
+
+        self.assertEqual(logs.records[0].ip, "203.0.113.42")
+
     def test_erros_4xx_sao_logados_como_warning(self):
         with self.assertLogs("lacrei.access", level="WARNING") as logs:
             self.client.get(reverse("profissional-detail", args=[999999]))
@@ -195,6 +218,12 @@ class SanitizacaoEValidadoresTests(SimpleTestCase):
     def test_sanitize_text(self):
         self.assertEqual(sanitize_text("  <b>Ana</b>\x07   Souza  "), "Ana Souza")
         self.assertEqual(sanitize_text("Linha 1\nLinha 2"), "Linha 1\nLinha 2")
+
+    def test_anonymize_ip(self):
+        self.assertEqual(anonymize_ip("203.0.113.42"), "203.0.113.0")
+        self.assertEqual(anonymize_ip("2001:db8:abcd:12::1"), "2001:db8:abcd::")
+        self.assertIsNone(anonymize_ip("nao-e-ip"))
+        self.assertIsNone(anonymize_ip(None))
 
     def test_only_digits(self):
         self.assertEqual(only_digits("(11) 99999-0000"), "11999990000")

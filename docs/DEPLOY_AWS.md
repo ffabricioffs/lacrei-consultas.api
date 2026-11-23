@@ -2,134 +2,141 @@
 
 ## Arquitetura
 
+Staging e produção rodam na **mesma instância EC2** (`lacrei-api`, `t3.micro`, `sa-east-1`), isolados entre si. Um único proxy (Caddy) recebe todo o tráfego em HTTPS na porta 443 e encaminha pelo nome do host.
+
 ```mermaid
 flowchart LR
     GH[GitHub Actions] -- push da imagem --> GHCR[(GitHub Container Registry)]
-    GH -- SSH: deploy.sh --> S[EC2 staging]
-    GH -- SSH: deploy.sh<br/>após aprovação --> P[EC2 produção]
-    subgraph EC2 [cada instância EC2]
-        C[Caddy :80/:443<br/>HTTPS automático] --> W[web: Gunicorn + Django]
-        W --> DB[(PostgreSQL<br/>volume Docker)]
+    GH -- "OIDC: credencial AWS temporária" --> IAM[IAM role<br/>github-actions-lacrei-deploy]
+    IAM -- "abre/fecha 22/tcp só para o IP do runner" --> SG[Security Group]
+    GH -- "SSH temporário: deploy.sh" --> EC2
+
+    subgraph EC2 [EC2 lacrei-api]
+        C["Caddy (lacrei-edge)<br/>:80 / :443"]
+        subgraph P [projeto production]
+            PW[web-production] --- PDB[(db + volume<br/>production_pgdata)]
+        end
+        subgraph S [projeto staging]
+            SW[web-staging] --- SDB[(db + volume<br/>staging_pgdata)]
+        end
+        C -->|15-229-49-123.sslip.io| PW
+        C -->|staging.15-229-49-123.sslip.io| SW
     end
-    S -. pull .-> GHCR
-    P -. pull .-> GHCR
 ```
 
-- **Uma instância por ambiente**: isolamento total de dados, segredos e recursos.
-- **Mesma imagem** (`sha-<commit>`) promovida de staging para produção.
-- Para economizar no começo, é possível rodar os dois ambientes **na mesma instância**: use diretórios diferentes (`/opt/lacrei/staging` e `/opt/lacrei/production`) e, no staging, `HTTP_PORT=8080`/`HTTPS_PORT=8443` (ou um único Caddy na frente roteando por domínio). Para a entrega, o recomendado é uma instância por ambiente.
-
-## Caminho usado neste projeto: 1 instância + sslip.io
-
-Staging e produção rodam na **mesma EC2**, isolados por diretório (`/opt/lacrei/staging` e `/opt/lacrei/production`), com banco, volumes e `.env` próprios. Como não há domínio próprio, o endereço vem do [sslip.io](https://sslip.io): `54-12-34-56.sslip.io` resolve para `54.12.34.56`, e o Caddy emite o certificado HTTPS para ele.
-
-| Ambiente | URL | Portas |
+| Ambiente | URL | Diretório na EC2 |
 |---|---|---|
-| Produção | `https://<ip-com-hifens>.sslip.io` | 80 / 443 (HTTPS automático) |
-| Staging | `http://<ip-com-hifens>.sslip.io:8080` | 8080 (HTTP) |
+| Produção | https://15-229-49-123.sslip.io | `/opt/lacrei/production` |
+| Staging | https://staging.15-229-49-123.sslip.io | `/opt/lacrei/staging` |
+| Proxy | portas 80 e 443 | `/opt/lacrei/edge` |
 
-1. **EC2 → Launch instance** (região `sa-east-1`, São Paulo)
-   - Nome `lacrei-api`, AMI **Ubuntu Server 24.04 LTS**, tipo `t3.small` ou `t3.micro` (use o que aparecer como *Free tier eligible*), disco de 20 GB gp3
-   - Key pair: opcional (o acesso administrativo pode ser feito pelo **EC2 Instance Connect** no navegador)
-   - Security Group: SSH 22, HTTP 80, HTTPS 443 e TCP 8080, todos de `0.0.0.0/0`. O SSH só aceita chave; não há login por senha.
-   - **Advanced details → User data**: cole o conteúdo de [`deploy/ec2-user-data.sh`](../deploy/ec2-user-data.sh) com `__DEPLOY_PUBKEY__` substituído pela chave pública de deploy e `__GITHUB_REPO__` por `usuario/repositorio`
-2. Aguarde cerca de 3 minutos (o script instala Docker, cria swap e gera os `.env` com segredos aleatórios) e anote o **IP público**.
-3. Cadastre os Environments e secrets no GitHub (tabela da seção 3; aqui `SSH_HOST` é o mesmo IP nos dois ambientes) e crie a variável `DEPLOY_ENABLED=true`.
-4. Rode o workflow **CI/CD** e aprove o job de produção.
-5. Senha do usuário `admin` da API: **EC2 → Connect → EC2 Instance Connect** e `sudo cat /root/lacrei-info.txt`.
+O endereço vem do [sslip.io](https://sslip.io): `15-229-49-123.sslip.io` (e qualquer subdomínio dele) resolve para `15.229.49.123`, e o Caddy emite certificados Let's Encrypt para os dois hosts.
 
-> Não associe um Elastic IP *depois* do boot sem atualizar os `.env`: o endereço sslip.io é calculado a partir do IP do primeiro boot. O IP automático só muda se a instância for **parada**; reiniciar (reboot) não muda.
+## Segregação entre os ambientes
 
-As seções abaixo descrevem o caminho com **duas instâncias e domínio próprio**, que é a evolução recomendada.
+| Recurso | Staging | Produção | Compartilhado? |
+|---|---|---|---|
+| Projeto Docker Compose | `staging` | `production` | Não |
+| Containers | `staging-web-1`, `staging-db-1` | `production-web-1`, `production-db-1` | Não |
+| Banco de dados | PostgreSQL próprio | PostgreSQL próprio | Não |
+| Volume de dados | `staging_pgdata` | `production_pgdata` | Não |
+| Rede do banco | `staging_backend` (interna, sem internet) | `production_backend` (interna, sem internet) | Não |
+| Segredos (`.env`, 600, dono `ubuntu`) | `/opt/lacrei/staging/.env` | `/opt/lacrei/production/.env` | Não: `SECRET_KEY`, senha do banco, senha do admin e token do webhook são gerados separadamente |
+| Configuração não sensível | GitHub Environment `staging` (`APP_URL`) | GitHub Environment `production` (`APP_URL`) | Não |
+| Credenciais de deploy | Environment `staging` | Environment `production` (exige aprovação manual) | Mesma chave SSH de deploy, escopos de Environment separados |
+| Rede `lacrei-edge` | `web-staging` | `web-production` | Sim, apenas proxy e containers `web`; os bancos não participam |
+| Proxy (Caddy) | host `staging.…` | host principal | Sim |
 
-## 1. Criar as instâncias
+**Como isso é comprovado:** ao fim de cada deploy de produção, o pipeline executa `scripts/segregation-report.sh` na EC2 e publica o resultado no resumo da execução. O relatório lista containers, redes, volumes, permissões dos `.env`, confirma que cada segredo é **diferente** entre os ambientes (sem exibir valores) e testa que o `web` de um ambiente **não alcança** o banco do outro.
 
-No console da AWS (região `sa-east-1`, São Paulo, ou `us-east-1`, mais barata):
+**Limites desta abordagem, e por que é aceitável aqui:** os dois ambientes dividem CPU, memória, disco e kernel. Uma sobrecarga no staging pode afetar a produção, e um comprometimento do host afeta os dois. Para o escopo do desafio (free tier), a separação lógica acima é suficiente. A evolução recomendada é uma instância (ou conta AWS) por ambiente, com RDS (veja o fim deste documento).
 
-1. **EC2 → Launch instance**
-   - Nome: `lacrei-api-staging` (repita depois para `lacrei-api-production`)
-   - AMI: **Ubuntu Server 24.04 LTS**
-   - Tipo: `t3.micro` (free tier) ou `t3.small` (mais folga para Postgres + Gunicorn)
-   - Key pair: crie uma para o **seu** acesso administrativo
-   - Armazenamento: 20 GB gp3
-2. **Security Group**
-   - `22/tcp`: apenas o seu IP. Para o GitHub Actions, há duas opções: liberar 22 para `0.0.0.0/0` com autenticação **só por chave** (mais simples para o desafio) ou usar AWS SSM/self-hosted runner (mais seguro, ver melhorias).
-   - `80/tcp` e `443/tcp`: `0.0.0.0/0`
-3. **Elastic IP**: aloque um e associe a cada instância (o IP não muda ao reiniciar).
-4. **DNS**: crie registros `A`, como `staging-api.seudominio.com.br` e `api.seudominio.com.br`, apontando para os IPs elásticos. Sem domínio? Use `SITE_ADDRESS=:80`, `DJANGO_SECURE_SSL_REDIRECT=false` e `DJANGO_SECURE_HSTS_SECONDS=0`, e acesse pelo IP via HTTP (só para demonstração).
+## Segurança de rede
 
-## 2. Preparar o servidor
+### Regras do Security Group `launch-wizard-1`
 
-```bash
-ssh -i sua-chave.pem ubuntu@<IP>
-
-# Docker + Compose plugin
-curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker ubuntu && newgrp docker
-docker compose version
-
-# Diretório do ambiente
-sudo mkdir -p /opt/lacrei/staging && sudo chown ubuntu:ubuntu /opt/lacrei/staging
-cd /opt/lacrei/staging
-nano .env       # copie de deploy/.env.server.example e preencha os segredos
-chmod 600 .env
-```
-
-> Em `t3.micro` (1 GB de RAM), crie um swap de 1–2 GB para evitar falta de memória durante o pull das imagens e as migrações:
-> `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile && echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab`
-
-## 3. Chave de deploy do GitHub Actions
-
-Gere uma chave **exclusiva** para o pipeline (não reutilize a sua):
-
-```bash
-# na sua máquina
-ssh-keygen -t ed25519 -C "github-actions-deploy" -f lacrei_deploy -N ""
-# copie a pública para o servidor
-ssh-copy-id -i lacrei_deploy.pub ubuntu@<IP>
-```
-
-No GitHub: **Settings → Environments → New environment**, crie `staging` e `production` e cadastre em cada um:
-
-| Nome | Tipo | Valor |
+| Porta | Origem | Para quê |
 |---|---|---|
-| `SSH_HOST` | Secret | IP elástico / DNS da instância do ambiente |
-| `SSH_USER` | Secret | `ubuntu` |
-| `SSH_PRIVATE_KEY` | Secret | conteúdo de `lacrei_deploy` (chave privada) |
-| `DEPLOY_PATH` | Secret | `/opt/lacrei/staging` ou `/opt/lacrei/production` |
-| `APP_URL` | Variable | `https://staging-api.seudominio.com.br` (sem barra no final) |
+| 80/tcp | `0.0.0.0/0` | Redirecionar para HTTPS e emitir certificados (desafio HTTP-01) |
+| 443/tcp | `0.0.0.0/0` | API (produção e staging) |
+| 22/tcp | Prefix list `com.amazonaws.sa-east-1.ec2-instance-connect` | Acesso administrativo pelo EC2 Instance Connect (autenticado pelo IAM e auditado no CloudTrail) |
+| 22/tcp | `IP do runner/32`, **temporária** | Criada no início do job de deploy e removida ao final, mesmo em caso de falha |
 
-No environment **`production`**, ative **Required reviewers** (você mesmo): o deploy de produção fica aguardando aprovação depois que o staging passa.
+A porta 22 **não fica aberta para a internet** e a antiga porta 8080 do staging foi **fechada**: o staging agora passa pelo mesmo proxy, em HTTPS na 443.
 
-## 4. Primeiro deploy
+### SSH temporário via OIDC (sem chaves AWS no GitHub)
 
-1. Crie a variável de repositório `DEPLOY_ENABLED` = `true` (*Settings → Secrets and variables → Actions → Variables*) e rode o workflow **CI/CD** de novo (ou faça um novo push na `main`). Acompanhe em **Actions**.
-2. Aprove o job **Deploy (produção)** quando o staging estiver ok.
-3. Crie o usuário de acesso em cada ambiente:
+O workflow `deploy.yml`:
 
-```bash
-cd /opt/lacrei/production
-IMAGE_NAME=ghcr.io/<usuario>/<repo> IMAGE_TAG=$(cat .deployed_tag) \
-  docker compose -f docker-compose.prod.yml exec web python manage.py createsuperuser
+1. Obtém credenciais AWS de curta duração assumindo o papel `github-actions-lacrei-deploy` via OIDC (`aws-actions/configure-aws-credentials`). Não há chave de acesso AWS guardada no GitHub.
+2. Descobre o IP público do runner e cria a regra `22/tcp IP/32` com a descrição `github-actions-<run_id>`.
+3. Faz o deploy e os smoke tests.
+4. Revoga a regra (`if: always()`).
+
+O papel só pode ser assumido por workflows **deste repositório** (condição `token.actions.githubusercontent.com:sub = repo:ffabricioffs/lacrei-consultas.api:*`). Ele só tem duas permissões, restritas a este Security Group:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "SshTemporarioNoDeploy",
+    "Effect": "Allow",
+    "Action": ["ec2:AuthorizeSecurityGroupIngress", "ec2:RevokeSecurityGroupIngress"],
+    "Resource": "arn:aws:ec2:sa-east-1:630758947048:security-group/sg-08c9c0560dd5f9f9a"
+  }]
+}
 ```
 
-4. Teste: `curl https://api.seudominio.com.br/health/` deve retornar `{"status": "ok", "version": "sha-..."}`.
+Variáveis de repositório usadas pelo workflow (*Settings → Secrets and variables → Actions → Variables*):
 
-> A imagem no GHCR herda a visibilidade do repositório. O pipeline faz `docker login` com o `GITHUB_TOKEN` do job, então funciona com repositório público ou privado.
+| Variável | Valor |
+|---|---|
+| `AWS_DEPLOY_ROLE_ARN` | `arn:aws:iam::630758947048:role/github-actions-lacrei-deploy` |
+| `AWS_REGION` | `sa-east-1` |
+| `AWS_SECURITY_GROUP_ID` | `sg-08c9c0560dd5f9f9a` |
+| `DEPLOY_ENABLED` | `true` |
+
+### Recomendações adicionais
+
+| Recomendação | Situação |
+|---|---|
+| Fechar a porta 22 para a internet | ✅ Feito (SSH temporário por execução + Instance Connect) |
+| Fechar a porta própria do staging (8080) | ✅ Feito (staging atrás do proxy, em HTTPS na 443) |
+| Restringir o staging a IPs da equipe ou VPN | Recomendado quando o staging deixar de ser avaliado publicamente: adicionar `remote_ip` ou `basic_auth` ao bloco do staging no `deploy/edge/Caddyfile` |
+| Substituir SSH por AWS Systems Manager (SSM Run Command) | Próximo passo: elimina a porta 22 por completo e a chave SSH de deploy |
+| Rotacionar a chave SSH de deploy | A cada 90 dias ou ao trocar a equipe: gerar nova chave, atualizar `authorized_keys` e o secret `SSH_PRIVATE_KEY` |
+| Alerta de custos | ✅ Orçamento "gasto zero" no AWS Budgets, com e-mail |
+
+## Como recriar do zero
+
+1. **EC2 → Launch instance**, na região `sa-east-1`:
+   - **Instância:** Ubuntu Server 24.04 LTS, `t3.micro` e 20 GB gp3.
+   - **Security Group:** portas 80 e 443 abertas, e a 22 apenas para o prefix list do EC2 Instance Connect.
+   - **User data:** em *Advanced details → User data*, cole [`deploy/ec2-user-data.sh`](../deploy/ec2-user-data.sh), substituindo `__DEPLOY_PUBKEY__` e `__GITHUB_REPO__`. O script instala Docker, cria swap, autoriza a chave de deploy e gera os dois `.env` com segredos aleatórios criados na própria máquina.
+2. **IAM → Identity providers → Add provider:** OpenID Connect, URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
+3. **IAM → Roles → Create role:** escolha Web identity e o provedor acima, organização `ffabricioffs`, repositório `lacrei-consultas.api`. Nomeie o papel `github-actions-lacrei-deploy` e adicione a política inline acima.
+4. **GitHub → Settings → Environments:** crie `staging` e `production`, esta com *Required reviewers*. Em cada um, cadastre os secrets `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY` e `DEPLOY_PATH` e a variável `APP_URL`. Depois crie as variáveis de repositório da tabela acima.
+5. Faça push na `main`. O pipeline faz o resto: na primeira execução, o `deploy.sh` cria a rede `lacrei-edge`, sobe o proxy e grava os hosts.
 
 ## Operação do dia a dia
 
+Acesse a instância pelo console: **EC2 → lacrei-api → Conectar → EC2 Instance Connect**.
+
 ```bash
 cd /opt/lacrei/production
-export IMAGE_NAME=ghcr.io/<usuario>/<repo> IMAGE_TAG=$(cat .deployed_tag)
+export IMAGE_NAME=ghcr.io/ffabricioffs/lacrei-consultas.api IMAGE_TAG=$(cat .deployed_tag) APP_ENV=production
 docker compose -f docker-compose.prod.yml ps
 docker compose -f docker-compose.prod.yml logs -f web
 docker compose -f docker-compose.prod.yml exec db pg_dump -U lacrei lacrei > backup_$(date +%F).sql
+./segregation-report.sh        # relatório de segregação entre os ambientes
+sudo cat /root/lacrei-info.txt # URLs e senhas do usuário admin de cada ambiente
 ```
 
-## Logs no CloudWatch (opcional)
+> O terminal do EC2 Instance Connect no navegador não aceita colar texto de uma vez em alguns navegadores. Se isso acontecer, digite os comandos.
 
-Para centralizar, troque o driver de log do serviço `web` em `deploy/docker-compose.prod.yml`:
+## Logs
+
+Finalidade, campos, acesso e retenção estão em [LOGS.md](LOGS.md). Para centralizar no CloudWatch, troque o driver de log do serviço `web` em `deploy/docker-compose.prod.yml`:
 
 ```yaml
 logging:
@@ -140,13 +147,14 @@ logging:
     awslogs-create-group: "true"
 ```
 
-E associe à instância uma IAM Role com `logs:CreateLogGroup`, `logs:CreateLogStream` e `logs:PutLogEvents`. Como os logs já são JSON, dá para filtrar no CloudWatch Logs Insights (`fields status, path, duration_ms | filter status >= 500`).
+Associe à instância uma IAM Role com `logs:CreateLogGroup`, `logs:CreateLogStream` e `logs:PutLogEvents`. Depois defina a retenção de 30 dias com `aws logs put-retention-policy --log-group-name /lacrei/api/production --retention-in-days 30`.
 
 ## Evolução recomendada
 
 | Hoje | Próximo passo |
 |---|---|
-| Postgres em container na EC2 | **RDS PostgreSQL** (backups automáticos, Multi-AZ): basta remover o serviço `db` e apontar `DATABASE_URL` |
-| SSH na porta 22 | **AWS SSM Run Command** + OIDC do GitHub (sem porta aberta nem chave de longa duração) |
-| GHCR | **ECR** (se a política exigir tudo dentro da AWS) |
+| Staging e produção na mesma EC2 | Uma instância (ou conta AWS) por ambiente |
+| Postgres em container | **RDS PostgreSQL** com backups automáticos: remover o serviço `db` e apontar `DATABASE_URL` |
+| SSH temporário por execução | **AWS SSM Run Command** com o mesmo papel OIDC, sem porta 22 |
+| GHCR | **ECR**, se a política exigir tudo dentro da AWS |
 | EC2 + Compose | **ECS Fargate + ALB** com deploy blue/green pelo CodeDeploy |

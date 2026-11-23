@@ -75,3 +75,23 @@
 - Sentry para rastrear exceções com o `request_id`.
 - Blue/green real com dois containers e troca no Caddy (zero downtime).
 - Preview deploys por pull request.
+
+## Revisão após a devolutiva da avaliação
+
+| Pedido | Decisão | Por quê |
+|---|---|---|
+| Produção só após staging | `if: needs.deploy-staging.result == 'success'` explícito, além do `needs` | Deixa a regra visível no workflow e independe do comportamento padrão do GitHub Actions |
+| Evidências do pipeline | Cada job escreve no `$GITHUB_STEP_SUMMARY` e publica artefatos | Quem avalia vê lint, testes, cobertura, build, smoke tests e versões na própria página da execução, sem acessar o servidor |
+| Deploy duplicado em staging e produção | Workflow reutilizável `deploy.yml` (também usado pelo rollback) | Um único lugar para a lógica de SSH temporário, smoke tests e rollback |
+| Restringir SSH | OIDC + regra temporária por execução, em vez de IP fixo | Os runners do GitHub mudam de IP a cada execução; liberar a faixa inteira do GitHub seria quase tão aberto quanto `0.0.0.0/0` |
+| Fechar a porta do staging | Proxy único (Caddy) na 443 para os dois ambientes, roteando por host | Staging ganha HTTPS, nenhuma porta extra fica exposta e a URL fica acessível a ferramentas que só aceitam HTTPS na porta padrão |
+| Demonstrar a segregação | Relatório gerado na EC2 a cada deploy de produção | Prova reproduzível e atualizada, sem expor valores de segredos |
+| Logs com IP | IP anonimizado por padrão e política em `docs/LOGS.md` | Minimização (LGPD), mantendo a utilidade para segurança |
+
+### Problemas encontrados nesta revisão
+
+| Problema | Solução |
+|---|---|
+| Migrar do Caddy por ambiente para o proxy único sem derrubar a produção enquanto o deploy de produção espera aprovação | O `deploy.sh` remove os proxies antigos, liga o container `web` em execução de cada ambiente à rede `lacrei-edge` e lê os hosts de todos os `.env` antes de subir o proxy novo |
+| O terminal do EC2 Instance Connect não aceita texto colado em alguns navegadores | Documentado em `docs/DEPLOY_AWS.md`; a operação rotineira passou a ser feita pelo pipeline |
+| Em caso de falha, o `deploy.sh` mostrava as últimas linhas do log no GitHub Actions, inclusive linhas de acesso | Agora mostra só as linhas que não são de acesso (erros), para não publicar dados de rede no log do pipeline |

@@ -4,9 +4,10 @@
 # criar a instância. Roda uma única vez, como root, no primeiro boot.
 #
 # Monta staging e produção na MESMA instância, isolados por diretório,
-# banco e .env próprios:
-#   produção -> https://<ip-com-hifens>.sslip.io        (portas 80/443, HTTPS automático)
-#   staging  -> http://<ip-com-hifens>.sslip.io:8080    (porta 8080, só HTTP)
+# projeto Docker Compose, banco, volume, rede interna e .env próprios.
+# Um único proxy (Caddy, deploy/edge) atende os dois em HTTPS na porta 443:
+#   produção -> https://<ip-com-hifens>.sslip.io
+#   staging  -> https://staging.<ip-com-hifens>.sslip.io
 #
 # Os segredos (SECRET_KEY, senhas do banco e do usuário da API) são gerados
 # aqui e nunca saem da instância. Log: /var/log/lacrei-bootstrap.log
@@ -60,24 +61,23 @@ criar_env() {
     admin_pass=$(openssl rand -base64 18 | tr -d '/+=')
 
     if [ "$ambiente" = "production" ]; then
-        local site="$HOST" http_port=80 https_port=443 ssl=true hsts=3600 cookies=true
-        local url="https://$HOST" workers=2
+        local site="$HOST" workers=2
     else
-        local site=":80" http_port=8080 https_port=8443 ssl=false hsts=0 cookies=false
-        local url="http://$HOST:8080" workers=1
+        local site="staging.$HOST" workers=1
     fi
+    local url="https://$site"
 
     cat > "$dir/.env" <<EOF
 # Gerado pelo ec2-user-data.sh em $(date -u +%FT%TZ)
 DJANGO_ENV=$ambiente
 DJANGO_DEBUG=false
 DJANGO_SECRET_KEY=$(segredo)
-DJANGO_ALLOWED_HOSTS=$HOST,$PUBLIC_IP
+DJANGO_ALLOWED_HOSTS=$site
 CSRF_TRUSTED_ORIGINS=$url
 CORS_ALLOWED_ORIGINS=$url
-DJANGO_SECURE_SSL_REDIRECT=$ssl
-DJANGO_SECURE_HSTS_SECONDS=$hsts
-DJANGO_SECURE_COOKIES=$cookies
+DJANGO_SECURE_SSL_REDIRECT=true
+DJANGO_SECURE_HSTS_SECONDS=3600
+DJANGO_SECURE_COOKIES=true
 LOG_LEVEL=INFO
 GUNICORN_WORKERS=$workers
 
@@ -86,9 +86,8 @@ POSTGRES_USER=lacrei
 POSTGRES_PASSWORD=$db_pass
 DATABASE_URL=postgres://lacrei:$db_pass@db:5432/lacrei
 
-SITE_ADDRESS=$site
-HTTP_PORT=$http_port
-HTTPS_PORT=$https_port
+# Host público do ambiente (lido pelo proxy único em /opt/lacrei/edge)
+SITE_HOST=$site
 
 # Usuário da API, criado no primeiro deploy (scripts/deploy.sh)
 DJANGO_SUPERUSER_USERNAME=admin
@@ -113,7 +112,7 @@ criar_env staging
 cat > /root/lacrei-info.txt <<EOF
 IP público:   $PUBLIC_IP
 Produção:     https://$HOST
-Staging:      http://$HOST:8080
+Staging:      https://staging.$HOST
 Repositório:  https://github.com/$GITHUB_REPO
 Usuário API:  admin
 Senha (prod): $(grep ^DJANGO_SUPERUSER_PASSWORD= /opt/lacrei/production/.env | cut -d= -f2)
