@@ -107,6 +107,8 @@ EOF
 
 criar_env production
 criar_env staging
+# Diretório do proxy único (preenchido pelo scripts/deploy.sh no primeiro deploy)
+install -d -o ubuntu -g ubuntu /opt/lacrei/edge
 
 # --- Resumo para consulta posterior: sudo cat /root/lacrei-info.txt ----------
 cat > /root/lacrei-info.txt <<EOF

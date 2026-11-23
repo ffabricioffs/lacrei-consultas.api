@@ -92,7 +92,12 @@ garantir_rede_edge() {
 }
 
 atualizar_proxy() {
-    install -d "$EDGE_DIR"
+    # /opt/lacrei pertence ao root: cria o diretório do proxy com sudo, já com o
+    # usuário de deploy como dono (só na primeira vez).
+    if [ ! -d "$EDGE_DIR" ]; then
+        install -d "$EDGE_DIR" 2>/dev/null \
+            || sudo install -d -o "$(id -u)" -g "$(id -g)" "$EDGE_DIR"
+    fi
     cp edge/docker-compose.yml edge/Caddyfile "$EDGE_DIR/"
 
     # Hosts de todos os ambientes da máquina (apenas hostnames, nada sensível).
