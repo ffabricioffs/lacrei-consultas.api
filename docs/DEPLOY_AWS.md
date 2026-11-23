@@ -73,7 +73,14 @@ O workflow `deploy.yml`:
 3. Faz o deploy e os smoke tests.
 4. Revoga a regra (`if: always()`).
 
-O papel só pode ser assumido por workflows **deste repositório** (condição `token.actions.githubusercontent.com:sub = repo:ffabricioffs/lacrei-consultas.api:*`). Ele só tem duas permissões, restritas a este Security Group:
+O papel só pode ser assumido por workflows **deste repositório**. A condição usa o formato de `sub` com IDs imutáveis que o GitHub emite para este repositório (dono `178303204`, repositório `1464612545`). Assim, mesmo que alguém recrie um repositório com o mesmo nome, ele terá outro ID e não poderá assumir o papel:
+
+```
+token.actions.githubusercontent.com:aud = sts.amazonaws.com
+token.actions.githubusercontent.com:sub = repo:ffabricioffs@178303204/lacrei-consultas.api@1464612545:*
+```
+
+Ele só tem duas permissões, restritas a este Security Group:
 
 ```json
 {
@@ -114,7 +121,7 @@ Variáveis de repositório usadas pelo workflow (*Settings → Secrets and varia
    - **Security Group:** portas 80 e 443 abertas, e a 22 apenas para o prefix list do EC2 Instance Connect.
    - **User data:** em *Advanced details → User data*, cole [`deploy/ec2-user-data.sh`](../deploy/ec2-user-data.sh), substituindo `__DEPLOY_PUBKEY__` e `__GITHUB_REPO__`. O script instala Docker, cria swap, autoriza a chave de deploy e gera os dois `.env` com segredos aleatórios criados na própria máquina.
 2. **IAM → Identity providers → Add provider:** OpenID Connect, URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
-3. **IAM → Roles → Create role:** escolha Web identity e o provedor acima, organização `ffabricioffs`, repositório `lacrei-consultas.api`. Nomeie o papel `github-actions-lacrei-deploy` e adicione a política inline acima.
+3. **IAM → Roles → Create role:** escolha Web identity e o provedor acima, organização `ffabricioffs`, repositório `lacrei-consultas.api`. Nomeie o papel `github-actions-lacrei-deploy` e adicione a política inline acima. Depois, em *Trust relationships*, ajuste o `sub` para o formato com IDs mostrado acima; o assistente do console gera o formato antigo, sem IDs, que o GitHub não envia mais.
 4. **GitHub → Settings → Environments:** crie `staging` e `production`, esta com *Required reviewers*. Em cada um, cadastre os secrets `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY` e `DEPLOY_PATH` e a variável `APP_URL`. Depois crie as variáveis de repositório da tabela acima.
 5. Faça push na `main`. O pipeline faz o resto: na primeira execução, o `deploy.sh` cria a rede `lacrei-edge`, sobe o proxy e grava os hosts.
 
