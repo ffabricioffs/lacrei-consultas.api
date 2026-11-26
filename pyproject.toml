@@ -23,7 +23,7 @@ package-mode = false
 
 [tool.poetry.group.dev.dependencies]
 ruff = ">=0.8"
-coverage = { version = ">=7.6", extras = ["toml"] }
+coverage = { version = ">=7.17.5", extras = ["toml"] }
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
